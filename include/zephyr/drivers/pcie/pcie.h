@@ -214,6 +214,12 @@ struct pcie_scan_opt {
 
 	/** Scan flags */
 	uint32_t flags;
+
+	/** Enable shell override for dynamic device scanning masks */
+	bool enable_shell_override;
+
+	/** Function to call to determine if a BDF is masked */
+	bool (*is_masked_fn)(pcie_bdf_t bdf);
 };
 
 /** Scan for PCIe devices.
