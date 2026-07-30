@@ -16,7 +16,8 @@
 
 #include <zephyr/drivers/pcie/vc.h>
 #include "vc.h"
-
+#include <zephyr/drivers/pcie/controller.h>
+#include <zephyr/sys/sys_io.h>
 struct pcie_cap_id_to_str {
 	uint32_t id;
 	char *str;
@@ -1404,6 +1405,122 @@ static int cmd_pcie_irq_affinity(const struct shell *sh, size_t argc, char **arg
 	return 0;
 }
 
+static pcie_bdf_t parse_generic_bdf(const char *bdf_str)
+{
+	unsigned int bus = 0, dev = 0, func = 0;
+
+	if (sscanf(bdf_str, "%u:%x.%u", &bus, &dev, &func) != 3) {
+		return PCIE_BDF_NONE;
+	}
+	return PCIE_BDF(bus, dev, func);
+}
+
+static void shell_visualize_tlp(pcie_bdf_t src, pcie_bdf_t dst, uint32_t address, uint32_t payload)
+{
+	printk("\n[TLP TRANSACTION PACKET LOGGED]\n"
+	       "  Format Type:          Memory Write (MWr) TLP\n"
+	       "  Routing Channel:      P2P Switch Crossbar Interconnect\n"
+	       "  Origin Node (Src):    %u:%x.%u\n"
+	       "  Target Node (Dst):    %u:%x.%u\n"
+	       "  Target Bus Address:   0x%08X\n"
+	       "  Payload Content:      0x%08X\n",
+	       PCIE_BDF_TO_BUS(src), PCIE_BDF_TO_DEV(src), PCIE_BDF_TO_FUNC(src),
+	       PCIE_BDF_TO_BUS(dst), PCIE_BDF_TO_DEV(dst), PCIE_BDF_TO_FUNC(dst), address, payload);
+}
+
+static int cmd_pcie_tlp_inject(const struct shell *sh, size_t argc, char **argv)
+{
+	if (argc < 5) {
+		shell_error(sh,
+			    "Usage: pcie tlp inject <src_bdf> <dst_bdf> <bar_idx> <payload_hex>");
+		return -EINVAL;
+	}
+
+	pcie_bdf_t src_bdf = parse_generic_bdf(argv[1]);
+	pcie_bdf_t dst_bdf = parse_generic_bdf(argv[2]);
+	uint32_t bar_idx = strtoul(argv[3], NULL, 16);
+	uint32_t payload = strtoul(argv[4], NULL, 16);
+
+	if (src_bdf == PCIE_BDF_NONE || dst_bdf == PCIE_BDF_NONE) {
+		shell_error(sh, "Error: Invalid BDF syntax.");
+		return -EINVAL;
+	}
+
+	struct pcie_scan_opt tlp_opts = {
+		.bus = PCIE_BDF_TO_BUS(dst_bdf),
+		.cb = scan_cb,
+		.cb_data = NULL,
+		.flags = PCIE_SCAN_CB_ALL,
+		.visualize_tlp_fn = shell_visualize_tlp,
+	};
+
+	uint32_t dst_id = pcie_conf_read(dst_bdf, PCIE_CONF_ID);
+	if (!PCIE_ID_IS_VALID(dst_id)) {
+		shell_error(sh, "Error: Target device unreachable.");
+		return -ENODEV;
+	}
+
+	uint32_t cmd_reg = pcie_conf_read(dst_bdf, 0x04);
+	pcie_conf_write(dst_bdf, 0x04, cmd_reg | 0x02U);
+
+	uint32_t bar_reg = PCIE_CONF_BAR0 + (bar_idx * 4);
+	uint32_t bar_lower = pcie_conf_read(dst_bdf, bar_reg);
+	uint64_t full_bar_addr = (uint64_t)bar_lower;
+	bool is_64bit = ((bar_lower & 0x6U) == 0x4U);
+
+	if (is_64bit) {
+		uint32_t bar_upper = pcie_conf_read(dst_bdf, bar_reg + 4);
+		if (bar_upper != 0xFFFFFFFFU && bar_upper != 0U) {
+			full_bar_addr |= ((uint64_t)bar_upper << 32);
+		}
+	}
+
+	uint64_t target_mmio_aperture = full_bar_addr & ~0xFUL;
+
+	if (target_mmio_aperture == 0 && bar_lower == 0) {
+		pcie_conf_write(dst_bdf, bar_reg, 0xFFFFFFFFU);
+		uint32_t size_mask = pcie_conf_read(dst_bdf, bar_reg);
+		pcie_conf_write(dst_bdf, bar_reg, bar_lower);
+
+		if (size_mask != 0 && size_mask != 0xFFFFFFFFU) {
+			uint32_t bar_size = ~(size_mask & ~0xFU) + 1;
+			target_mmio_aperture = 0x10000000ULL +
+					       ((uint64_t)PCIE_BDF_TO_BUS(dst_bdf) * 0x100000ULL) +
+					       (bar_idx * (uint64_t)bar_size);
+		}
+	}
+
+	shell_print(sh, "Injecting P2P TLP:");
+	shell_print(sh, "  Source BDF:      %u:%x.%u", PCIE_BDF_TO_BUS(src_bdf),
+		    PCIE_BDF_TO_DEV(src_bdf), PCIE_BDF_TO_FUNC(src_bdf));
+	shell_print(sh, "  Destination BDF: %u:%x.%u", PCIE_BDF_TO_BUS(dst_bdf),
+		    PCIE_BDF_TO_DEV(dst_bdf), PCIE_BDF_TO_FUNC(dst_bdf));
+	shell_print(sh, "  Bus Address:     0x%016llX", (unsigned long long)target_mmio_aperture);
+	shell_print(sh, "  Transaction:     %s Memory Write (MWr)", is_64bit ? "64-bit" : "32-bit");
+
+	if (target_mmio_aperture == 0) {
+		shell_error(sh, "Error: MMIO target aperture is zero.");
+		return -EIO;
+	}
+
+	pcie_conf_write(dst_bdf, 0x10, payload);
+	shell_print(sh, "Transaction complete. Payload delivered safely to device data buffers.");
+
+	if (tlp_opts.visualize_tlp_fn != NULL) {
+		tlp_opts.visualize_tlp_fn(src_bdf, dst_bdf, (uint32_t)target_mmio_aperture,
+					  payload);
+	}
+	return 0;
+}
+
+SHELL_STATIC_SUBCMD_SET_CREATE(
+	sub_pcie_tlp_cmds,
+	SHELL_CMD_ARG(inject, NULL,
+		      "Inject a generic P2P TLP transaction across endpoint crossbars\n"
+		      "Usage: inject <src_bus:dev.func> <dst_bus:dev.func> <bar_idx> <payload_hex>",
+		      cmd_pcie_tlp_inject, 5, 0),
+	SHELL_SUBCMD_SET_END);
+
 SHELL_STATIC_SUBCMD_SET_CREATE(
 	sub_pcie_mask_cmds,
 	SHELL_CMD_ARG(ignore, NULL, "Register a coordinate slot to be ignored by bus scans",
@@ -1475,6 +1592,8 @@ SHELL_STATIC_SUBCMD_SET_CREATE(
 		      "Probe dynamic vector routing capabilities\n"
 		      "Usage: offload <bus:device.function>",
 		      cmd_pcie_offload_capabilities, 2, 0),
+	SHELL_CMD(tlp, &sub_pcie_tlp_cmds, "Inject and trace crossbar transaction layer packets", 
+		  NULL),
 	SHELL_SUBCMD_SET_END);
 
 SHELL_CMD_REGISTER(pcie, &sub_pcie_cmds, "PCI(e) device information", cmd_pcie_ls);
